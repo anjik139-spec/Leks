@@ -1,0 +1,97 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.lex
+    command: ["python", "server.py"]
+    env_file: .env.lex
+    environment:
+      DATA_DIR: /data
+      WORKER_EMBEDDED: "1"
+    volumes:
+      - lex-data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.lex
+    command: ["python", "worker.py"]
+    env_file: .env.lex
+    environment:
+      DATA_DIR: /data
+      WORKERS: "2"
+    volumes:
+      - lex-data:/data
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.lex
+    command: ["python", "bot.py"]
+    env_file:
+      - .env.lex
+      - .env.brain
+    environment:
+      DATA_DIR: /data
+      BRAIN_DATA_DIR: /app/brain_data
+    volumes:
+      - lex-data:/data
+      - ./brain_data:/app/brain_data
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET}
+    profiles: ["scale"]
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  botapi:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${API_ID}
+      TELEGRAM_API_HASH: ${API_HASH}
+      TELEGRAM_LOCAL: "true"
+    profiles: ["scale"]
+    volumes:
+      - botapi_data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
+volumes:
+  lex-data:
+  caddy_data:
+  minio_data:
+  botapi_data:
