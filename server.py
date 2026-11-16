@@ -131,7 +131,10 @@ async def sec(req, handler):
 
 
 async def index(req):
-    return web.FileResponse("webapp/index.html")
+    for candidate in ("webapp/index.html", "index.html"):
+        if os.path.exists(candidate):
+            return web.FileResponse(candidate)
+    raise web.HTTPNotFound()
 
 
 async def health(req):
