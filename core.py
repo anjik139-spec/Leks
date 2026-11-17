@@ -6,7 +6,7 @@ import random
 import db
 import gen
 import providers
-from config import DATA, OWNERS, WEBAPP_URL
+from config import DATA, NOTIFY_DEFAULT, OWNERS, WEBAPP_URL
 
 COST = {
     "photo": 1,
@@ -23,6 +23,16 @@ COST = {
     "batch": 0,
 }
 CAPS = {"free": 1, "lite": 2, "pro": 3, "studio": 6}
+SLOW = {"video", "clip", "batch"}
+
+
+def should_notify(uid, kind):
+    mode = db.user(uid).get("notify_mode") or NOTIFY_DEFAULT
+    if mode == "all":
+        return True
+    if mode == "off":
+        return False
+    return kind in SLOW
 
 
 class Err(Exception):
@@ -96,7 +106,7 @@ def submit(uid, kind, p):
         jid = "c" + str(db.now() * 1000) + str(random.randint(10, 99))
         db.x(
             "INSERT INTO jobs(id,uid,kind,params,status,cost,files,ts,notify,priority) "
-            "VALUES(?,?,?,?, 'done',0,?,?,1,?)",
+            "VALUES(?,?,?,?, 'done',0,?,?,?,?)",
             (
                 jid,
                 uid,
@@ -104,6 +114,7 @@ def submit(uid, kind, p):
                 json.dumps(params, ensure_ascii=False),
                 json.dumps(hit),
                 db.now(),
+                1,
                 1 if pro else 0,
             ),
         )
@@ -112,8 +123,10 @@ def submit(uid, kind, p):
     if cost:
         db.upd(uid, balance=u["balance"] - cost)
     jid = "j" + str(db.now() * 1000) + str(random.randint(10, 99))
+    nf = 0 if should_notify(uid, kind) else 1
     db.x(
-        "INSERT INTO jobs(id,uid,kind,params,cost,ts,priority) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO jobs(id,uid,kind,params,cost,ts,priority,notify) "
+        "VALUES(?,?,?,?,?,?,?,?)",
         (
             jid,
             uid,
@@ -122,6 +135,7 @@ def submit(uid, kind, p):
             cost,
             db.now(),
             2 if tier == "studio" else 1 if pro else 0,
+            nf,
         ),
     )
     db.ev(uid, "job_" + kind)

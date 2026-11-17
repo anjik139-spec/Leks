@@ -11,6 +11,14 @@ LLM_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
+VISION_MODEL = os.environ.get("VISION_MODEL", LLM_MODEL)
+LT_URL = os.environ.get("LT_URL", "")
+OCR_LANGS = os.environ.get("OCR_LANGS", "rus+eng")
+MAX_OCR_PAGES = int(os.environ.get("MAX_OCR_PAGES", "12"))
+AUTO_PRIVATE = os.environ.get("AUTO_PRIVATE", "1") == "1"
+AUTO_GROUP = os.environ.get("AUTO_GROUP", "0") == "1"
+MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "20"))
+INTEL_CONCURRENCY = int(os.environ.get("INTEL_CONCURRENCY", "2"))
 
 PHOTO_API_URL = os.environ.get("PHOTO_API_URL", "")
 PHOTO_API_KEY = os.environ.get("PHOTO_API_KEY", "")
@@ -35,6 +43,15 @@ MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)
 DAILY_BUDGET = float(os.environ.get("DAILY_BUDGET", "5"))
 INIT_TTL = 3600
 WORKERS = int(os.environ.get("WORKERS", "2"))
+JOB_STALE_SEC = int(os.environ.get("JOB_STALE_SEC", "180"))
+NOTIFY_DEFAULT = os.environ.get("NOTIFY_DEFAULT", "smart")
+TTS_ENABLED = os.environ.get("TTS_ENABLED", "1") == "1"
+TTS_VOICE = os.environ.get("TTS_VOICE", "ru-RU-DmitryNeural")
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "600"))
+EPHEMERAL_TTL_DAYS = int(os.environ.get("EPHEMERAL_TTL_DAYS", "7"))
+ORPHAN_TTL_DAYS = int(os.environ.get("ORPHAN_TTL_DAYS", "3"))
+EVENTS_TTL_DAYS = int(os.environ.get("EVENTS_TTL_DAYS", "90"))
+CACHE_TTL_DAYS = int(os.environ.get("CACHE_TTL_DAYS", "30"))
 MODERATION = os.environ.get(
     "MODERATION",
     "nsfw,porn, porno, порно, эротик, наркот, расчлен, beheading, gore, underage, малолет",

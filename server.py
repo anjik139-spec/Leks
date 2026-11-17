@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gzip
 import hashlib
 import hmac
 import io
@@ -18,6 +19,8 @@ import core
 import db
 import gen
 import providers
+import ratelimit
+import templates as T
 import worker
 from config import (
     BOT_TOKEN,
@@ -86,7 +89,7 @@ async def auth(req):
         raise web.HTTPUnauthorized(
             text='{"code":"auth"}', content_type="application/json"
         )
-    if not rl("g" + str(u["id"]), 90, 60):
+    if not await ratelimit.allow("g" + str(u["id"]), 90, 60):
         raise web.HTTPTooManyRequests(
             text='{"code":"rate"}', content_type="application/json"
         )
@@ -96,10 +99,16 @@ async def auth(req):
 
 
 def jerr(code, status=400):
-    raise web.HTTPException(
+    exc = {
+        400: web.HTTPBadRequest,
+        401: web.HTTPUnauthorized,
+        403: web.HTTPForbidden,
+        404: web.HTTPNotFound,
+        429: web.HTTPTooManyRequests,
+    }.get(status, web.HTTPBadRequest)
+    raise exc(
         text=json.dumps({"code": code}),
         content_type="application/json",
-        status=status,
     )
 
 
@@ -135,6 +144,108 @@ async def index(req):
         if os.path.exists(candidate):
             return web.FileResponse(candidate)
     raise web.HTTPNotFound()
+
+
+async def library(req):
+    return await _gzip_html("webapp/library.html")
+
+
+async def _gzip_html(path):
+    try:
+        with open(path, "rb") as file:
+            raw = file.read()
+    except OSError:
+        raise web.HTTPNotFound()
+    body = gzip.compress(raw, 9)
+    return web.Response(
+        body=body,
+        content_type="text/html",
+        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+    )
+
+
+async def samples_page(req):
+    return await _gzip_html("webapp/samples.html")
+
+
+async def presets_get(req):
+    u = await auth(req)
+    rows = db.q(
+        "SELECT data FROM presets WHERE uid=? ORDER BY ts", (u["id"],)
+    )
+    return web.json_response(
+        {"presets": [json.loads(r["data"]) for r in rows]}
+    )
+
+
+async def presets_post(req):
+    u = await auth(req)
+    p = await req.json()
+    if not p.get("id"):
+        jerr("bad")
+    db.x(
+        "INSERT OR REPLACE INTO presets(uid,id,data,ts) VALUES(?,?,?,?)",
+        (u["id"], p["id"], json.dumps(p, ensure_ascii=False), db.now()),
+    )
+    return web.json_response({"ok": True})
+
+
+async def presets_del(req):
+    u = await auth(req)
+    db.x(
+        "DELETE FROM presets WHERE uid=? AND id=?",
+        (u["id"], req.match_info["id"]),
+    )
+    return web.json_response({"ok": True})
+
+
+async def tpl_catalog(req):
+    await auth(req)
+    return web.json_response({"items": T.catalog(), "disclaimer": T.DISCLAIMER})
+
+
+async def tpl_make(req):
+    u = await auth(req)
+    body = await req.json()
+    key = req.headers.get("Idempotency-Key") or body.get("idem") or ""
+    prev = db.idem_claim(u["id"], key)
+    if prev:
+        if prev.get("__inflight"):
+            jerr("inflight", 409)
+        return web.json_response(dict(prev, replay=True))
+    tpl_key = body.get("key")
+    fmt = body.get("fmt")
+    if (
+        tpl_key not in T.DOCS
+        and tpl_key not in T.SHEETS
+        and tpl_key not in T.FILES
+    ):
+        db.idem_drop(u["id"], key)
+        jerr("bad")
+    if not await ratelimit.allow("tpl" + str(u["id"]), 30, 60):
+        db.idem_drop(u["id"], key)
+        jerr("rate", 429)
+    try:
+        name, data, mime = await asyncio.to_thread(
+            T.render,
+            tpl_key,
+            body.get("fields"),
+            bool(body.get("blank")),
+            fmt,
+        )
+        stored = f"tpl_{u['id']}_{db.now()}_{name}"
+        gen.save(stored, data)
+        db.ev(u["id"], "template_" + tpl_key)
+        payload = {
+            "name": name,
+            "url": surl(stored, u["id"]),
+            "size": len(data),
+        }
+        db.idem_done(u["id"], key, payload)
+        return web.json_response(payload)
+    except Exception:
+        db.idem_drop(u["id"], key)
+        raise
 
 
 async def health(req):
@@ -236,11 +347,19 @@ async def state(req):
 async def jobs(req):
     u = await auth(req)
     p = await req.json()
-    if not rl("gen" + str(u["id"]), 8, 60):
+    key = req.headers.get("Idempotency-Key") or p.get("idem") or ""
+    prev = db.idem_claim(u["id"], key)
+    if prev:
+        if prev.get("__inflight"):
+            jerr("inflight", 409)
+        return web.json_response(dict(prev, replay=True))
+    if not await ratelimit.allow("gen" + str(u["id"]), 8, 60):
+        db.idem_drop(u["id"], key)
         jerr("rate", 429)
     try:
         r = core.submit(u["id"], p.get("mode"), p)
     except core.Err as e:
+        db.idem_drop(u["id"], key)
         jerr(
             e.code,
             402
@@ -249,6 +368,7 @@ async def jobs(req):
             if e.code in ("rate", "busy")
             else 400,
         )
+    db.idem_done(u["id"], key, r)
     return web.json_response(r)
 
 
@@ -562,59 +682,73 @@ async def promo(req):
 async def invoice(req):
     u = await auth(req)
     body = await req.json()
-    plan = body.get("plan")
-    pack = body.get("pack")
-    gift = int(body.get("gift_to", 0) or 0)
-    if plan in PLANS:
-        amount, days, sub = PLANS[plan]
-        payload = f"{'gift' if gift else 'pro'}:{plan}:{u['id']}:{gift}"
-        tg = {
-            "title": ("🎁 Подарок PRO " if gift else "PRO ") + plan,
-            "description": "Безлимит и приоритет",
-            "payload": payload,
-            "currency": "XTR",
-            "prices": [{"label": "PRO", "amount": amount}],
-        }
-        if sub:
-            tg["subscription_period"] = 2592000
-    elif pack in PACKS:
-        g, amount = PACKS[pack]
-        payload = f"{'giftpack' if gift else 'pack'}:{pack}:{u['id']}:{gift}"
-        tg = {
-            "title": f"{g} призраков",
-            "description": "Пакет 👻",
-            "payload": payload,
-            "currency": "XTR",
-            "prices": [{"label": f"{g} 👻", "amount": amount}],
-        }
-    else:
-        jerr("bad")
-    import aiohttp
+    key = req.headers.get("Idempotency-Key") or body.get("idem") or ""
+    prev = db.idem_claim(u["id"], key)
+    if prev:
+        if prev.get("__inflight"):
+            jerr("inflight", 409)
+        return web.json_response(dict(prev, replay=True))
+    try:
+        plan = body.get("plan")
+        pack = body.get("pack")
+        gift = int(body.get("gift_to", 0) or 0)
+        if plan in PLANS:
+            amount, days, sub = PLANS[plan]
+            payload = f"{'gift' if gift else 'pro'}:{plan}:{u['id']}:{gift}"
+            tg = {
+                "title": ("🎁 Подарок PRO " if gift else "PRO ") + plan,
+                "description": "Безлимит и приоритет",
+                "payload": payload,
+                "currency": "XTR",
+                "prices": [{"label": "PRO", "amount": amount}],
+            }
+            if sub:
+                tg["subscription_period"] = 2592000
+        elif pack in PACKS:
+            g, amount = PACKS[pack]
+            payload = (
+                f"{'giftpack' if gift else 'pack'}:{pack}:{u['id']}:{gift}"
+            )
+            tg = {
+                "title": f"{g} призраков",
+                "description": "Пакет 👻",
+                "payload": payload,
+                "currency": "XTR",
+                "prices": [{"label": f"{g} 👻", "amount": amount}],
+            }
+        else:
+            jerr("bad")
+        import aiohttp
 
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/createInvoiceLink",
-            json=tg,
-            proxy=PROXY or None,
-        ) as r:
-            j = await r.json()
-        if not j.get("ok") and tg.get("subscription_period"):
-            tg.pop("subscription_period")
+        async with aiohttp.ClientSession() as s:
             async with s.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/createInvoiceLink",
                 json=tg,
                 proxy=PROXY or None,
             ) as r:
                 j = await r.json()
-    if not j.get("ok"):
-        jerr("invoice", 502)
-    return web.json_response({"link": j["result"]})
+            if not j.get("ok") and tg.get("subscription_period"):
+                tg.pop("subscription_period")
+                async with s.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/createInvoiceLink",
+                    json=tg,
+                    proxy=PROXY or None,
+                ) as r:
+                    j = await r.json()
+        if not j.get("ok"):
+            jerr("invoice", 502)
+        result = {"link": j["result"]}
+        db.idem_done(u["id"], key, result)
+        return web.json_response(result)
+    except Exception:
+        db.idem_drop(u["id"], key)
+        raise
 
 
 async def improve(req):
     u = await auth(req)
     b = await req.json()
-    if not rl("imp" + str(u["id"]), 10, 60):
+    if not await ratelimit.allow("imp" + str(u["id"]), 10, 60):
         jerr("rate", 429)
     text = providers.llm(
         [
@@ -632,12 +766,12 @@ async def improve(req):
     src = "llm"
     if not text:
         boost = {
-            "Кино": "кинематографичный свет, малая ГРИП, teal-orange",
-            "Аниме": "чистые линии, закатный свет",
-            "Неон": "неоновые отражения, мокрый асфальт, туман",
-            "Акварель": "растечки краски, текстура бумаги",
-            "Ретро": "synthwave, зерно плёнки",
-            "3D": "изометрия, мягкие тени, AO",
+            "Кино": "кинематографичный свет, малая ГРИП, цветокоррекция teal-orange, 85mm",
+            "Неон": "неоновые отражения, мокрый асфальт, объёмный туман, киберпанк",
+            "Аниме": "чистые линии, выразительные глаза, мягкий закатный свет",
+            "Акварель": "мягкие растечки краски, текстура бумаги, пастельные тона",
+            "Ретро": "synthwave-палитра, хромовые блики, зерно плёнки",
+            "3D": "изометрия, мягкие тени, ambient occlusion, чистый рендер",
         }
         text = (
             f"{b.get('prompt', '')}, {boost.get(b.get('style'), boost['Кино'])}, "
@@ -661,7 +795,7 @@ async def v1_gen(req):
     if not r:
         jerr("auth", 401)
     uid = r[0]["id"]
-    if not rl("v1" + str(uid), 12, 60):
+    if not await ratelimit.allow("v1" + str(uid), 12, 60):
         jerr("rate", 429)
     p = await req.json()
     try:
@@ -748,6 +882,13 @@ async def admin_user(req):
         )
     if bal:
         db.upd(uid, balance=max(0, d["balance"] + bal))
+    db.audit(
+        u["id"],
+        "grant",
+        uid,
+        {"days": days, "balance": bal, "tier": b.get("tier")},
+        req.remote,
+    )
     return web.json_response({"user": db.user(uid)})
 
 
@@ -770,6 +911,7 @@ async def admin_promo(req):
             db.now() + int(b.get("days", 30)) * 86400,
         ),
     )
+    db.audit(u["id"], "promo_create", code, b, req.remote)
     return web.json_response({"ok": True, "code": code})
 
 
@@ -790,6 +932,13 @@ async def admin_broadcast(req):
             db.now(),
         ),
     )
+    db.audit(
+        u["id"],
+        "broadcast",
+        "all",
+        {"len": len(text)},
+        req.remote,
+    )
     return web.json_response({"ok": True})
 
 
@@ -802,6 +951,7 @@ async def admin_flag(req):
         "INSERT OR REPLACE INTO flags VALUES(?,?,?)",
         (b.get("key", ""), b.get("val", "1"), int(b.get("pct", 100))),
     )
+    db.audit(u["id"], "flag", b.get("key"), b, req.remote)
     return web.json_response({"ok": True})
 
 
@@ -859,14 +1009,94 @@ app = web.Application(
     client_max_size=6 * 1024 * 1024,
     middlewares=[sec],
 )
+async def admin_budget(req):
+    u = await auth(req)
+    if u["id"] not in OWNERS:
+        jerr("forbidden", 403)
+    from config import DAILY_BUDGET
+
+    return web.json_response(
+        {
+            "cap": DAILY_BUDGET,
+            "today": db.spend_today(),
+            "left": round(
+                max(0, DAILY_BUDGET - db.spend_today()), 4
+            ),
+            "providers": db.spend_breakdown(1),
+            "week": db.spend_breakdown(7),
+        }
+    )
+
+
+async def admin_poller(req):
+    u = await auth(req)
+    if u["id"] not in OWNERS:
+        jerr("forbidden", 403)
+    import poller
+
+    return web.json_response(
+        {"holder": await poller.holder(), "me": poller.ID}
+    )
+
+
+async def admin_audit(req):
+    u = await auth(req)
+    if u["id"] not in OWNERS:
+        jerr("forbidden", 403)
+    return web.json_response(
+        {
+            "rows": db.q(
+                "SELECT * FROM audit ORDER BY ts DESC LIMIT 100"
+            )
+        }
+    )
+
+
+async def admin_clean(req):
+    u = await auth(req)
+    if u["id"] not in OWNERS:
+        jerr("forbidden", 403)
+    dry = bool((await req.json()).get("dry"))
+    import housekeeping
+
+    r = await asyncio.to_thread(housekeeping.sweep, dry)
+    db.audit(u["id"], "housekeeping", "files", r, req.remote)
+    return web.json_response(r)
+
+
+async def cancel(req):
+    u = await auth(req)
+    jid = (await req.json()).get("id")
+    st = db.cancel_job(u["id"], jid)
+    if st == "notfound":
+        jerr("notfound", 404)
+    db.ev(u["id"], "cancel_" + st)
+    return web.json_response(
+        {
+            "status": st,
+            "balance": db.user(u["id"])["balance"],
+        }
+    )
+
+
 app.add_routes(
     [
         web.get("/", index),
+        web.get("/library", library),
+        web.get("/library.html", library),
+        web.get("/samples", samples_page),
+        web.get("/samples.html", samples_page),
+        web.get("/api/presets", presets_get),
+        web.post("/api/presets", presets_post),
+        web.delete("/api/presets/{id}", presets_del),
+        web.get("/api/templates", tpl_catalog),
+        web.post("/api/template", tpl_make),
         web.get("/healthz", health),
         web.get("/metrics", metrics),
         web.get("/api/state", state),
         web.post("/api/jobs", jobs),
         web.get("/api/jobs/{id}", job_get),
+        web.post("/api/cancel", cancel),
         web.post("/api/fav", fav),
         web.post("/api/delete", delete),
         web.post("/api/restore", restore),
@@ -892,6 +1122,10 @@ app.add_routes(
         web.post("/v1/generate", v1_gen),
         web.get("/v1/jobs/{id}", v1_job),
         web.get("/api/admin/stats", admin_stats),
+        web.get("/api/admin/budget", admin_budget),
+        web.get("/api/admin/poller", admin_poller),
+        web.get("/api/admin/audit", admin_audit),
+        web.post("/api/admin/clean", admin_clean),
         web.post("/api/admin/user", admin_user),
         web.post("/api/admin/promo", admin_promo),
         web.post("/api/admin/broadcast", admin_broadcast),
@@ -899,7 +1133,8 @@ app.add_routes(
         web.get("/files/{name}", files),
     ]
 )
-app.on_startup.append(on_start)
+if not os.environ.get("PYTEST"):
+    app.on_startup.append(on_start)
 
 if __name__ == "__main__":
     web.run_app(app, port=int(os.environ.get("PORT", "8080")))

@@ -6,14 +6,11 @@ import os
 import random
 import re
 import struct
+import tempfile
 import wave
 
-from config import DATA, LLM_BASE, LLM_KEY, LLM_MODEL, MODERATION
-
-MOD_RE = re.compile(
-    "|".join(w.strip() for w in MODERATION.split(",") if w.strip()),
-    re.I,
-)
+from config import DATA, LLM_BASE, LLM_KEY, LLM_MODEL
+from doclib import MOD_RE
 STYLES = {
     "Кино": (("#0e3a4a", "#177e89", "#ff8c42", "#ffd23f"), False),
     "Аниме": (("#7d9bff", "#ffb7d5", "#fff3b0", "#ff5ca8"), False),
@@ -435,14 +432,35 @@ def load(name):
     if c: return c.get_object(Bucket=S3_BUCKET, Key=name)["Body"].read()
     with open(os.path.join(DATA, "files", name), "rb") as f: return f.read()
 
+
+def remove(name):
+    c = s3()
+    if c:
+        try:
+            c.delete_object(Bucket=S3_BUCKET, Key=name)
+        except Exception:
+            pass
+    p = os.path.join(DATA, "files", name)
+    if os.path.exists(p):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
 def path(name):
     p = os.path.join(DATA, "files", name)
     if not os.path.exists(p) and s3():
-        with open(p, "wb") as f: f.write(load(name))
+        with open(p, "wb") as f:
+            f.write(load(name))
     return p
 
+
 def tmp(data, ext):
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=ext); f.write(data); f.close(); return f.name
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="lex_")
+    f.write(data)
+    f.close()
+    return f.name
 
 def svg2png(svg):
     import cairosvg

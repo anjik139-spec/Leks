@@ -201,12 +201,15 @@ def stt(data):
     except Exception:
         return None
 
-def tts(text, out):
+def tts(text, out, voice=None):
+    from config import TTS_VOICE
+
+    v = voice or TTS_VOICE
     try:
         import asyncio
         import edge_tts
 
-        asyncio.run(edge_tts.Communicate(text, "ru-RU-DmitryNeural").save(out))
+        asyncio.run(edge_tts.Communicate(text, v).save(out))
         return True
     except Exception:
         pass

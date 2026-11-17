@@ -9,6 +9,7 @@ import aiohttp
 
 import db
 import gen
+import housekeeping
 import providers
 from config import BOT_API_URL, BOT_TOKEN, CHANNEL_ID, DATA, OWNERS, WORKERS
 
@@ -314,6 +315,22 @@ async def one(job):
         db.x("UPDATE jobs SET status='done',files='[]' WHERE id=?", (job["id"],))
         return
     files = await asyncio.to_thread(render, job, params)
+    if db.q("SELECT cancel FROM jobs WHERE id=?", (job["id"],))[0]["cancel"]:
+        for f in files:
+            try:
+                gen.remove(f["name"])
+            except Exception:
+                pass
+        db.x(
+            "UPDATE jobs SET status='cancelled',files='[]',notify=1 WHERE id=?",
+            (job["id"],),
+        )
+        if job["cost"]:
+            db.x(
+                "UPDATE users SET balance=balance+? WHERE id=?",
+                (job["cost"], job["uid"]),
+            )
+        return
     db.x(
         "UPDATE jobs SET status='done',files=? WHERE id=?",
         (json.dumps(files), job["id"]),
@@ -331,24 +348,49 @@ async def one(job):
         await send_message(user["ref_by"], "👻 +5 призраков за друга!")
 
 
-async def loop(worker_id):
-    while True:
-        job = db.claim()
-        if not job:
-            await asyncio.sleep(0.6 + worker_id * 0.1)
-            continue
+async def _beat(jid, stop):
+    while not stop.is_set():
+        db.beat(jid)
         try:
-            await one(job)
-        except Exception as exc:
-            db.retry(job, str(exc))
-            if job["tries"] >= 3:
+            await asyncio.wait_for(stop.wait(), 30)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def loop(wid):
+    while True:
+        j = db.claim()
+        if not j:
+            await asyncio.sleep(0.6 + wid * 0.1)
+            continue
+        stop = asyncio.Event()
+        bt = asyncio.create_task(_beat(j["id"], stop))
+        try:
+            await one(j)
+        except Exception as e:
+            db.retry(j, str(e))
+            if j["tries"] >= 3:
                 await alert(
-                    f"job {job['id']} ({job['kind']}) failed: {str(exc)[:150]}"
+                    f"job {j['id']} ({j['kind']}) failed: {str(e)[:150]}"
                 )
+        finally:
+            stop.set()
+            bt.cancel()
+
+
+async def reaper_loop():
+    while True:
+        try:
+            n = db.reap()
+            if n:
+                await alert(f"♻️ Возвращено в очередь зависших задач: {n}")
+        except Exception as e:
+            await alert("reaper: " + str(e)[:120])
+        await asyncio.sleep(60)
 
 
 async def crons():
-    last = {"rem": 0, "dig": 0, "win": 0, "chan": 0}
+    last = {"rem": 0, "win": 0, "chan": 0}
     while True:
         now = db.now()
         if now - last["rem"] > 3600:
@@ -378,25 +420,6 @@ async def crons():
                     f"👻 Скучали! Промокод {code} на 10 призраков — введи в меню → PRO.",
                 )
                 db.upd(user["id"], winback=1)
-        if now - last["dig"] > 7 * 86400:
-            last["dig"] = now
-            for user in db.q("SELECT id FROM users"):
-                stats = {
-                    kind: db.q(
-                        "SELECT COUNT(*) c FROM jobs WHERE uid=? AND kind=? AND status='done' AND ts>?",
-                        (user["id"], kind, now - 7 * 86400),
-                    )[0]["c"]
-                    for kind in ("photo", "video", "song", "doc")
-                }
-                stats["gen"] = sum(stats.values())
-                if stats["gen"]:
-                    card = gen.digest_card(user["id"], stats)
-                    gen.save(f"dig_{user['id']}.png", card)
-                    await tg(
-                        "sendPhoto",
-                        {"chat_id": user["id"], "caption": "📊 Твои итоги недели"},
-                        {"photo": (f"dig_{user['id']}.png", card, "image/png")},
-                    )
         if CHANNEL_ID and now - last["chan"] > 86400:
             last["chan"] = now
             top = db.q(
@@ -424,8 +447,27 @@ async def crons():
         await asyncio.sleep(30)
 
 
+async def housekeeping_loop():
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            r = await asyncio.to_thread(housekeeping.sweep)
+            if r["files"] or r["tmp"]:
+                await alert(
+                    f"🧹 Уборка: файлов {r['files']} "
+                    f"({r['freed_mb']} МБ), tmp {r['tmp']}"
+                )
+        except Exception as e:
+            await alert("housekeeping: " + str(e)[:120])
+
+
 async def main():
-    await asyncio.gather(*[loop(i) for i in range(WORKERS)], crons())
+    await asyncio.gather(
+        *[loop(i) for i in range(WORKERS)],
+        crons(),
+        reaper_loop(),
+        housekeeping_loop(),
+    )
 
 
 if __name__ == "__main__":
