@@ -3,7 +3,7 @@ meta:
   toolchain:
     name: docker
 build:
-  dockerfile: Dockerfile
+  dockerfile: Dockerfile.lex
   skip: false
 run:
   persistenceMount: /data
